@@ -1,0 +1,3 @@
+/home/tracy/Desktop/thread_pool_project/thread_pool_project/build/CMakeFiles/advanced_thread_pool.dir
+/home/tracy/Desktop/thread_pool_project/thread_pool_project/build/CMakeFiles/edit_cache.dir
+/home/tracy/Desktop/thread_pool_project/thread_pool_project/build/CMakeFiles/rebuild_cache.dir

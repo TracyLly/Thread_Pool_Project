@@ -1,72 +1,166 @@
-#include "ThreadPool.h"
+#include "AdvancedThreadPool.hpp"
+#include "Logger.hpp"
+#include "Monitor.hpp"
+#include "SignalWatcher.hpp"
+#include "SimulatedWork.hpp"
 
+#include <atomic>
 #include <chrono>
-#include <exception>
+#include <csignal>
+#include <future>
 #include <iostream>
 #include <mutex>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <vector>
 
-namespace {
-std::mutex g_print_mutex;
-//这里的锁保证多线程打印不乱
-int heavyWork(int task_id, int sleep_ms) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-
-    {
-        std::lock_guard<std::mutex> lock(g_print_mutex);
-        std::cout << "task " << task_id
-                  << " finished in thread " << std::this_thread::get_id()
-                  << ", sleep_ms=" << sleep_ms << std::endl;
-    }
-
-    return task_id * task_id;
-}
-
-void logMessage(const std::string &message, int sleep_ms) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-
-    std::lock_guard<std::mutex> lock(g_print_mutex);
-    std::cout << "log from thread " << std::this_thread::get_id()
-              << ": " << message << std::endl;
-}
-} // namespace
-
 int main() {
-    try {
-        ThreadPool pool(4);
-        std::vector<std::future<int>> futures;
+    sigset_t signal_set;
+    sigemptyset(&signal_set);
+    sigaddset(&signal_set, SIGINT);
+    sigaddset(&signal_set, SIGTERM);
 
-        std::cout << "thread pool size = " << pool.size() << std::endl;
-
-        for (int i = 0; i < 8; ++i) {
-            int sleep_ms = 300 + (i % 3) * 200;
-            futures.emplace_back(pool.submit(heavyWork, i, sleep_ms));
-        }
-        //总共提交8个平方任务，submit提交任务，其返回std::future<int>类型的值被futures保存放到动态数组尾部
-        std::future<void> log_future = pool.submit(logMessage, "hello thread pool", 400);
-        //提交void日志任务，submit返回值类型std::future<void>
-        std::future<int> sum_future = pool.submit([](int a, int b) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            return a + b;
-        }, 10, 32);
-        //提交lambda求和任务，[]表示不捕获外部变量，(int a, int b)为参数列表，{...}函数体
-        int total = 0;
-        for (std::future<int> &future : futures) {
-            total += future.get();//future.get()会阻塞并且只能取一次
-        //因为任务是并发执行的，所以看到的task finished顺序不是按0,1,2,3...固定排列的
-        }
-        //开始收集8个平方任务的结果，主线程会依次等待8个heavywork任务完成，并将返回值相加
-        log_future.get();
-
-        std::cout << "sum_future result = " << sum_future.get() << std::endl;
-        std::cout << "square sum total = " << total << std::endl;
-        std::cout << "main thread exit" << std::endl;
-    } catch (const std::exception &ex) {
-        std::cerr << "error: " << ex.what() << std::endl;
+    int mask_ret = pthread_sigmask(SIG_BLOCK, &signal_set, nullptr);
+    if (mask_ret != 0) {
+        std::cerr << "pthread_sigmask failed" << std::endl;
         return 1;
     }
+
+    std::atomic<bool> app_stop(false);
+
+    AdvancedThreadPool pool(4, 10);
+
+    std::thread signal_thread(
+        signalWatcher,
+        signal_set,
+        std::ref(pool),
+        std::ref(app_stop)
+    );
+
+    std::thread monitor_thread(
+        monitorLoop,
+        std::ref(pool),
+        std::ref(app_stop)
+    );
+
+    std::vector<std::future<int>> futures;
+    std::mutex futures_mutex;
+
+    std::vector<std::thread> clients;
+
+    for (int client_id = 0; client_id < 3; ++client_id) {
+        clients.emplace_back([client_id, &pool, &futures, &futures_mutex, &app_stop]() {
+            for (int i = 0; i < 18; ++i) {
+                if (app_stop.load()) {
+                    break;
+                }
+
+                int priority = i % 5;
+                int cost_ms = 100 + ((client_id + i) % 6) * 80;
+
+                std::string task_name =
+                    "client-" + std::to_string(client_id) +
+                    "-task-" + std::to_string(i);
+
+                try {
+                    std::future<int> future = pool.submit(
+                        task_name,
+                        priority,
+                        simulatedWork,
+                        client_id,
+                        i,
+                        cost_ms
+                    );
+
+                    {
+                        std::lock_guard<std::mutex> lock(futures_mutex);
+                        futures.push_back(std::move(future));
+                    }
+
+                    logLine(
+                        "[client " + std::to_string(client_id) +
+                        "] submit " + task_name +
+                        ", priority=" + std::to_string(priority)
+                    );
+                } catch (const std::exception& e) {
+                    logLine(
+                        "[client " + std::to_string(client_id) +
+                        "] submit failed: " + std::string(e.what())
+                    );
+                    break;
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            }
+
+            logLine("[client " + std::to_string(client_id) + "] exit");
+        });
+    }
+
+    std::thread admin_thread([&pool, &app_stop]() {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        if (!app_stop.load()) {
+            pool.pause();
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        if (!app_stop.load()) {
+            pool.resume();
+        }
+
+        logLine("[admin] exit");
+    });
+
+    for (std::thread& client : clients) {
+        if (client.joinable()) {
+            client.join();
+        }
+    }
+
+    if (admin_thread.joinable()) {
+        admin_thread.join();
+    }
+
+    pool.shutdown(true);
+    app_stop.store(true);
+
+    if (signal_thread.joinable()) {
+        signal_thread.join();
+    }
+
+    if (monitor_thread.joinable()) {
+        monitor_thread.join();
+    }
+
+    int success_results = 0;
+    int failed_results = 0;
+
+    for (std::future<int>& future : futures) {
+        try {
+            int value = future.get();
+            ++success_results;
+            logLine("[main] future result=" + std::to_string(value));
+        } catch (const std::exception& e) {
+            ++failed_results;
+            logLine("[main] future exception=" + std::string(e.what()));
+        }
+    }
+
+    AdvancedThreadPool::Snapshot final_snapshot = pool.snapshot();
+
+    logLine(
+        "[main] final: submitted=" + std::to_string(final_snapshot.submitted_tasks) +
+        ", completed=" + std::to_string(final_snapshot.completed_tasks) +
+        ", failed=" + std::to_string(final_snapshot.failed_tasks) +
+        ", rejected=" + std::to_string(final_snapshot.rejected_tasks) +
+        ", success_results=" + std::to_string(success_results) +
+        ", failed_results=" + std::to_string(failed_results)
+    );
+
+    logLine("[main] exit");
 
     return 0;
 }

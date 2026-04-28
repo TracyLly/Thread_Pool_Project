@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
-project(thread_pool_demo LANGUAGES CXX)
+
+project(AdvancedThreadPoolProject LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,9 +8,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
 
-add_executable(thread_pool_demo
+include_directories(${PROJECT_SOURCE_DIR}/include)
+
+set(SOURCES
     src/main.cpp
+    src/AdvancedThreadPool.cpp
+    src/Logger.cpp
+    src/Monitor.cpp
+    src/SignalUtils.cpp
+    src/SignalWatcher.cpp
+    src/SimulatedWork.cpp
+    src/TimeUtils.cpp
 )
 
-target_include_directories(thread_pool_demo PRIVATE include)
-target_link_libraries(thread_pool_demo PRIVATE Threads::Threads)
+add_executable(advanced_thread_pool ${SOURCES})
+
+target_link_libraries(advanced_thread_pool PRIVATE Threads::Threads)
